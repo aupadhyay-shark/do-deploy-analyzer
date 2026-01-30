@@ -1,189 +1,146 @@
 # DO Deploy Analyzer
 
-A GitHub Marketplace App that automatically analyzes DigitalOcean App Platform deployment failures and provides AI-powered suggestions directly in your repository.
+AI-powered deployment failure analysis for DigitalOcean App Platform. Automatically detects failed deployments, analyzes logs with GPT-4, and posts suggestions directly to GitHub.
 
 ## How It Works
 
 ```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│  User pushes    │────▶│  DO deploys     │────▶│  GitHub sends   │
-│  code to GitHub │     │  (fails)        │     │  webhook        │
-└─────────────────┘     └─────────────────┘     └────────┬────────┘
-                                                         │
-                                                         ▼
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│  Comment on     │◀────│  LLM analyzes   │◀────│  App receives   │
-│  commit/PR      │     │  the failure    │     │  event          │
-└─────────────────┘     └─────────────────┘     └─────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                     DO Deploy Analyzer                          │
+│                                                                 │
+│   Poll DO API ──▶ Detect Failure ──▶ Analyze Logs ──▶ Post to  │
+│   (every 60s)                        (GPT-4)         GitHub    │
+└─────────────────────────────────────────────────────────────────┘
 ```
+
+1. **Polls** all your DigitalOcean apps every 60 seconds
+2. **Detects** build failures and runtime crashes
+3. **Fetches** deployment logs from DO API
+4. **Analyzes** with GPT-4 to identify root cause and suggest fixes
+5. **Posts** analysis as a comment on the failing commit in GitHub
 
 ## Features
 
-- **Automatic Detection** - Listens to `deployment_status` events from GitHub
-- **AI Analysis** - Uses GPT-4 to analyze failure logs and suggest fixes
-- **GitHub Integration** - Posts analysis as commit comments and check runs
-- **Webhook Security** - Verifies GitHub webhook signatures
-- **Configuration API** - Per-installation settings
+- Automatic polling (no webhook setup required)
+- Detects both build failures and runtime crashes
+- AI-powered root cause analysis
+- Posts directly to GitHub commits
+- Works with any DO App Platform app
 
 ## Quick Start
 
-### 1. Create a GitHub App
+### 1. Create GitHub App
 
-1. Go to **GitHub Settings** → **Developer settings** → **GitHub Apps** → **New GitHub App**
-
-2. Configure:
-   | Field | Value |
-   |-------|-------|
-   | Name | `DO Deploy Analyzer` |
-   | Homepage URL | `https://your-app.ondigitalocean.app` |
-   | Webhook URL | `https://your-app.ondigitalocean.app/webhook/github` |
-   | Webhook secret | Generate a secure secret |
-
-3. Set permissions:
-   ```
-   Repository permissions:
-   ├── Checks: Read & write
-   ├── Commit statuses: Read & write
-   ├── Contents: Read-only
-   ├── Deployments: Read-only
-   └── Pull requests: Read & write
-   ```
-
-4. Subscribe to events:
-   - ✅ Deployment status
-   - ✅ Check suite
-
-5. Generate and download the **Private Key**
+1. Go to [GitHub Developer Settings](https://github.com/settings/apps/new)
+2. Create app with permissions:
+   - **Checks**: Read & write
+   - **Commit statuses**: Read & write
+   - **Contents**: Read-only
+3. Generate and download private key
+4. Note your App ID
 
 ### 2. Deploy to DigitalOcean
 
-#### Option A: Via Dashboard
+[![Deploy to DO](https://www.deploytodo.com/do-btn-blue.svg)](https://cloud.digitalocean.com/apps/new?repo=https://github.com/aupadhyay-shark/do-deploy-analyzer/tree/main)
 
-1. Go to [DigitalOcean Apps](https://cloud.digitalocean.com/apps)
-2. Click **Create App**
-3. Select this repository
-4. Set environment variables (see below)
-5. Deploy
-
-#### Option B: Via CLI
-
-```bash
-doctl apps create --spec .do/app.yaml
-```
+Or manually:
+1. Create app from this repo
+2. Set environment variables (see below)
 
 ### 3. Set Environment Variables
 
-Set these in the DigitalOcean Dashboard for security:
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `DIGITALOCEAN_TOKEN` | Yes | DO API token (for fetching logs) |
+| `GITHUB_APP_ID` | Yes | Your GitHub App ID |
+| `GITHUB_APP_PRIVATE_KEY` | Yes | GitHub App private key (PEM) |
+| `OPENAI_API_KEY` | Yes | OpenAI API key |
+| `GITHUB_WEBHOOK_SECRET` | No | Webhook secret (if using webhooks) |
+| `POLL_INTERVAL_SECONDS` | No | Polling interval (default: 60) |
+| `ENABLE_POLLING` | No | Enable/disable polling (default: true) |
 
-| Variable | Description |
-|----------|-------------|
-| `GITHUB_APP_ID` | Your GitHub App ID |
-| `GITHUB_APP_PRIVATE_KEY` | PEM private key (full content) |
-| `GITHUB_WEBHOOK_SECRET` | Webhook secret from GitHub App |
-| `OPENAI_API_KEY` | OpenAI API key for LLM analysis |
+### 4. Install GitHub App
 
-### 4. Update Webhook URL
-
-After deployment, update your GitHub App's webhook URL:
-```
-https://do-deploy-analyzer-xxxxx.ondigitalocean.app/webhook/github
-```
+1. Go to your GitHub App settings
+2. Install on repositories you want to monitor
+3. That's it! The analyzer will automatically detect failures
 
 ## API Endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/webhook/github` | POST | Receives GitHub webhooks |
 | `/health` | GET | Health check |
-| `/api/config/{id}` | GET | Get installation config |
-| `/api/config/{id}` | POST | Update installation config |
-| `/` | GET | App info |
-
-## Local Development
-
-```bash
-# Clone the repo
-git clone https://github.com/your-username/do-deploy-analyzer
-cd do-deploy-analyzer
-
-# Create .env file
-cp .env.example .env
-# Edit .env with your credentials
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Run locally
-uvicorn app:app --reload --port 8000
-
-# Run tests
-python test_app.py
-```
+| `/analyze` | POST | Manually analyze logs |
+| `/register-repo` | POST | Map repo to DO app ID |
+| `/webhook/github` | POST | GitHub webhook receiver |
 
 ## Example Output
 
-When a deployment fails, users see a comment like:
+When a deployment fails, you'll see a comment like this on the commit:
 
 ```markdown
 ## 🚨 Deployment Failed - AI Analysis
 
-**Environment:** `production`
-**Commit:** `a1b2c3d4`
+**App:** `my-app`
+**Commit:** `abc12345`
 
 ---
 
-## 🔍 Root Cause
-The deployment failed because `numpy` requires compilation 
-but build-essential is missing.
+## Root Cause
+The deployment failed because `express` is not imported before use.
 
-## 🛠️ Suggested Fix
-Add to your Dockerfile before pip install:
-​```dockerfile
-RUN apt-get update && apt-get install -y build-essential
-​```
+## Suggested Fix
+Add this import at the top of your file:
+const express = require('express');
+const app = express();
 
-## 💡 Prevention Tips
-- Use slim-buster instead of alpine for Python apps
-- Pin package versions in requirements.txt
+## Prevention Tips
+- Use a linter to catch undefined variables
+- Add pre-commit hooks to validate code
 ```
 
-## Publishing to GitHub Marketplace
+## Local Development
 
-1. Ensure your repo is public
-2. Go to GitHub App settings
-3. Click **"List in Marketplace"**
-4. Fill in listing details:
-   - Description
-   - Pricing (Free / Paid)
-   - Categories (CI/CD, Deployment)
-5. Submit for review
+```bash
+# Clone
+git clone https://github.com/aupadhyay-shark/do-deploy-analyzer
+cd do-deploy-analyzer
 
-## Project Structure
+# Install
+pip install -r requirements.txt
 
-```
-do-deploy-analyzer/
-├── .do/
-│   └── app.yaml         # DigitalOcean deployment spec
-├── app.py               # Main FastAPI application
-├── requirements.txt     # Python dependencies
-├── Dockerfile           # Container image
-├── test_app.py          # Test script
-├── .env.example         # Environment template
-└── README.md            # This file
+# Configure
+cp .env.example .env
+# Edit .env with your credentials
+
+# Run
+uvicorn app:app --reload
 ```
 
-## Tech Stack
+## Architecture
 
-- **FastAPI** - Web framework
-- **OpenAI GPT-4** - LLM for analysis
-- **PyJWT** - GitHub App authentication
-- **httpx** - HTTP client
+```
+app.py
+├── Polling System
+│   ├── poll_for_failed_deployments()  # Background task
+│   ├── check_all_apps_for_failures()  # Check all apps
+│   ├── check_app_deployment()         # Check single app
+│   └── check_for_runtime_errors()     # Detect crashes
+│
+├── Analysis
+│   ├── process_failed_deployment()    # Main handler
+│   ├── analyze_deployment_failure()   # LLM analysis
+│   └── fetch_latest_deployment_logs() # Get logs
+│
+├── GitHub Integration
+│   ├── find_installation_for_repo()   # Find app installation
+│   ├── get_installation_token()       # Auth token
+│   └── post_analysis_to_github()      # Post comment
+│
+└── DO Integration
+    └── get_do_app_info()              # Get app details
+```
 
 ## License
 
-MIT License - see [LICENSE](LICENSE)
-
-## Support
-
-- Issues: [GitHub Issues](https://github.com/your-username/do-deploy-analyzer/issues)
-- Email: support@your-domain.com
+MIT
