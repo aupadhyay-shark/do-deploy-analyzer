@@ -10,20 +10,183 @@ import hashlib
 import httpx
 import jwt
 import time
-from datetime import datetime
-from fastapi import FastAPI, Request, HTTPException, Header
+import asyncio
+from datetime import datetime, timedelta
+from fastapi import FastAPI, Request, HTTPException, Header, BackgroundTasks
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Set
+from contextlib import asynccontextmanager
 import logging
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Track processed deployments to avoid duplicates
+processed_deployments: Set[str] = set()
+
+# DigitalOcean API
+DO_API_BASE = "https://api.digitalocean.com/v2"
+DIGITALOCEAN_TOKEN = os.getenv("DIGITALOCEAN_TOKEN")
+
+# Polling configuration
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))  # Check every 60 seconds
+ENABLE_POLLING = os.getenv("ENABLE_POLLING", "true").lower() == "true"
+
+
+# Background polling task
+async def poll_for_failed_deployments():
+    """Background task that polls DO API for failed deployments."""
+    logger.info(f"🔄 Starting deployment polling (interval: {POLL_INTERVAL_SECONDS}s)")
+    
+    while True:
+        try:
+            await check_all_apps_for_failures()
+        except Exception as e:
+            logger.error(f"Polling error: {e}")
+        
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+
+async def check_all_apps_for_failures():
+    """Check all DO apps for recent failed deployments."""
+    if not DIGITALOCEAN_TOKEN:
+        return
+    
+    async with httpx.AsyncClient() as client:
+        # Get all apps
+        response = await client.get(
+            f"{DO_API_BASE}/apps",
+            headers={"Authorization": f"Bearer {DIGITALOCEAN_TOKEN}"}
+        )
+        
+        if response.status_code != 200:
+            logger.error(f"Failed to list apps: {response.text}")
+            return
+        
+        apps = response.json().get("apps", [])
+        
+        for app_data in apps:
+            app_id = app_data.get("id")
+            app_name = app_data.get("spec", {}).get("name", "unknown")
+            
+            # Check latest deployment
+            await check_app_deployment(app_id, app_name)
+
+
+async def check_app_deployment(app_id: str, app_name: str):
+    """Check a specific app for failed deployments."""
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            f"{DO_API_BASE}/apps/{app_id}/deployments",
+            headers={"Authorization": f"Bearer {DIGITALOCEAN_TOKEN}"},
+            params={"per_page": 3}
+        )
+        
+        if response.status_code != 200:
+            return
+        
+        deployments = response.json().get("deployments", [])
+        
+        for deployment in deployments:
+            deployment_id = deployment.get("id")
+            phase = deployment.get("phase", "")
+            
+            # Skip if already processed
+            if deployment_id in processed_deployments:
+                continue
+            
+            # Check if this is a recent failure (within last 10 minutes)
+            created_at = deployment.get("created_at", "")
+            if created_at:
+                try:
+                    deploy_time = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                    if datetime.now(deploy_time.tzinfo) - deploy_time > timedelta(minutes=10):
+                        # Too old, skip
+                        processed_deployments.add(deployment_id)
+                        continue
+                except:
+                    pass
+            
+            # Check for failure
+            if phase in ["ERROR", "FAILED"]:
+                logger.info(f"🚨 Found failed deployment: {app_name} ({deployment_id[:8]})")
+                
+                # Mark as processed
+                processed_deployments.add(deployment_id)
+                
+                # Process this failure
+                await process_failed_deployment(app_id, app_name, deployment)
+                
+                # Only process the most recent failure per app
+                break
+
+
+async def process_failed_deployment(app_id: str, app_name: str, deployment: dict):
+    """Process a failed deployment - fetch logs, analyze, post to GitHub."""
+    logger.info(f"Processing failed deployment for {app_name}")
+    
+    # Get app info
+    app_info = await get_do_app_info(app_id)
+    if not app_info:
+        logger.error(f"Failed to get app info for {app_id}")
+        return
+    
+    # Fetch logs
+    logs = await fetch_latest_deployment_logs(app_id)
+    if not logs:
+        logs = "No detailed logs available"
+    
+    github_repo = app_info.get("github_repo")
+    commit_sha = app_info.get("commit_sha", "unknown")
+    
+    # Analyze with LLM
+    analysis = await analyze_deployment_failure(
+        logs=logs,
+        repo_name=github_repo or app_name,
+        commit_sha=commit_sha,
+        deployment_env="digitalocean"
+    )
+    
+    # Post to GitHub
+    if github_repo and commit_sha != "unknown":
+        success = await post_analysis_to_github(
+            repo=github_repo,
+            commit_sha=commit_sha,
+            analysis=analysis,
+            app_name=app_name,
+            logs_snippet=logs[-500:] if logs else ""
+        )
+        
+        if success:
+            logger.info(f"✅ Posted analysis to GitHub for {app_name}")
+        else:
+            logger.warning(f"⚠️ Could not post to GitHub for {app_name}")
+    else:
+        logger.warning(f"⚠️ No GitHub repo found for {app_name}, analysis not posted")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan handler to start background polling."""
+    # Startup
+    if ENABLE_POLLING and DIGITALOCEAN_TOKEN:
+        asyncio.create_task(poll_for_failed_deployments())
+        logger.info("✅ Background polling started")
+    else:
+        logger.info("ℹ️ Polling disabled or DO token not set")
+    
+    yield
+    
+    # Shutdown
+    logger.info("Shutting down...")
+
+
 app = FastAPI(
     title="DO Deploy Analyzer",
     description="GitHub App that analyzes DigitalOcean deployment failures",
-    version="1.0.0"
+    version="2.0.0",
+    lifespan=lifespan
 )
 
 # =============================================================================
@@ -37,9 +200,6 @@ GITHUB_WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET")
 
 # OpenAI for LLM analysis
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-# DigitalOcean API (optional - for fetching logs if user provides token)
-DO_API_BASE = "https://api.digitalocean.com/v2"
 
 
 # =============================================================================
@@ -562,9 +722,6 @@ async def connect_digitalocean(installation_id: int, do_token: str):
 # =============================================================================
 # DigitalOcean Direct Integration
 # =============================================================================
-
-# DigitalOcean token for fetching logs (set via env var)
-DIGITALOCEAN_TOKEN = os.getenv("DIGITALOCEAN_TOKEN")
 
 # Store repo -> DO app mappings
 repo_app_mappings = {}
