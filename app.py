@@ -236,19 +236,29 @@ async def process_failed_deployment(app_id: str, app_name: str, deployment: dict
     )
     
     # Post to GitHub
-    if github_repo and commit_sha != "unknown":
-        success = await post_analysis_to_github(
-            repo=github_repo,
-            commit_sha=commit_sha,
-            analysis=analysis,
-            app_name=app_name,
-            logs_snippet=logs[-500:] if logs else ""
-        )
+    if github_repo:
+        # If commit_sha is unknown, try to get latest commit from GitHub
+        if commit_sha == "unknown":
+            fetched_commit = await get_latest_commit_from_github(github_repo)
+            if fetched_commit:
+                commit_sha = fetched_commit
+                logger.info(f"Fetched latest commit from GitHub: {commit_sha[:8]}")
         
-        if success:
-            logger.info(f"✅ Posted analysis to GitHub for {app_name}")
+        if commit_sha and commit_sha != "unknown":
+            success = await post_analysis_to_github(
+                repo=github_repo,
+                commit_sha=commit_sha,
+                analysis=analysis,
+                app_name=app_name,
+                logs_snippet=logs[-500:] if logs else ""
+            )
+            
+            if success:
+                logger.info(f"✅ Posted analysis to GitHub for {app_name}")
+            else:
+                logger.warning(f"⚠️ Could not post to GitHub for {app_name}")
         else:
-            logger.warning(f"⚠️ Could not post to GitHub for {app_name}")
+            logger.warning(f"⚠️ Could not determine commit SHA for {github_repo}")
     else:
         logger.warning(f"⚠️ No GitHub repo found for {app_name}, analysis not posted")
 
