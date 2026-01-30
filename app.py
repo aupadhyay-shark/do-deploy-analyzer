@@ -970,30 +970,47 @@ async def get_do_app_info(app_id: str) -> Optional[dict]:
         
         app_data = response.json().get("app", {})
         spec = app_data.get("spec", {})
+        app_name = spec.get("name", "")
         
-        # Extract GitHub repo from spec
+        logger.info(f"Extracting GitHub info for app: {app_name}")
+        
+        # Extract GitHub repo from spec - check all component types
         github_repo = None
-        for service in spec.get("services", []):
-            github = service.get("github", {})
-            if github:
-                repo = github.get("repo", "")
-                github_repo = repo
-                break
+        component_types = ["services", "workers", "jobs", "static_sites", "functions"]
         
-        # Also check for git source
-        if not github_repo:
-            for service in spec.get("services", []):
-                git = service.get("git", {})
+        for component_type in component_types:
+            if github_repo:
+                break
+            for component in spec.get(component_type, []):
+                # Check github source
+                github = component.get("github", {})
+                if github and github.get("repo"):
+                    github_repo = github.get("repo")
+                    logger.info(f"Found GitHub repo in {component_type}.github: {github_repo}")
+                    break
+                
+                # Check git source (for repo_clone_url)
+                git = component.get("git", {})
                 if git:
                     repo_url = git.get("repo_clone_url", "")
-                    # Extract owner/repo from URL
                     if "github.com" in repo_url:
-                        parts = repo_url.rstrip(".git").split("github.com/")
-                        if len(parts) > 1:
-                            github_repo = parts[1]
-                    break
+                        # Extract owner/repo from URL like https://github.com/owner/repo.git
+                        parts = repo_url.replace("https://", "").replace("http://", "").replace(".git", "")
+                        if "github.com/" in parts:
+                            github_repo = parts.split("github.com/")[1]
+                            logger.info(f"Found GitHub repo in {component_type}.git: {github_repo}")
+                            break
+                
+                # Check source (some apps use this format)
+                source = component.get("source", {})
+                if source:
+                    source_github = source.get("github", {})
+                    if source_github and source_github.get("repo"):
+                        github_repo = source_github.get("repo")
+                        logger.info(f"Found GitHub repo in {component_type}.source.github: {github_repo}")
+                        break
         
-        # Get latest deployment commit
+        # Get latest deployment for commit info
         commit_sha = None
         deployments_response = await client.get(
             f"{DO_API_BASE}/apps/{app_id}/deployments",
@@ -1004,24 +1021,52 @@ async def get_do_app_info(app_id: str) -> Optional[dict]:
         if deployments_response.status_code == 200:
             deployments = deployments_response.json().get("deployments", [])
             if deployments:
-                # Get commit from deployment cause
-                cause = deployments[0].get("cause", {})
-                if isinstance(cause, dict):
-                    commit_sha = cause.get("commit_sha") or cause.get("git_sha", "")
+                deployment = deployments[0]
                 
-                # Also try from spec
+                # Try multiple places for commit SHA
+                # 1. From cause
+                cause = deployment.get("cause", {})
+                if isinstance(cause, dict):
+                    commit_sha = cause.get("commit_sha") or cause.get("git_sha") or cause.get("sha", "")
+                    if commit_sha:
+                        logger.info(f"Found commit from cause: {commit_sha[:8]}")
+                
+                # 2. From deployment spec
                 if not commit_sha:
-                    dep_spec = deployments[0].get("spec", {})
-                    for service in dep_spec.get("services", []):
-                        github = service.get("github", {})
-                        if github:
-                            commit_sha = github.get("commit_sha", "")
+                    dep_spec = deployment.get("spec", {})
+                    for component_type in component_types:
+                        for component in dep_spec.get(component_type, []):
+                            github = component.get("github", {})
+                            if github:
+                                commit_sha = github.get("commit_sha", "")
+                                if commit_sha:
+                                    logger.info(f"Found commit from deployment spec: {commit_sha[:8]}")
+                                    break
+                                    
+                                # Also try to get repo from deployment spec if not found earlier
+                                if not github_repo and github.get("repo"):
+                                    github_repo = github.get("repo")
+                                    logger.info(f"Found GitHub repo in deployment spec: {github_repo}")
+                        if commit_sha:
                             break
+                
+                # 3. From deployment progress/git info
+                if not commit_sha:
+                    progress = deployment.get("progress", {})
+                    for step in progress.get("steps", []):
+                        if "commit" in str(step).lower():
+                            # Try to extract commit from step info
+                            step_str = str(step)
+                            if "sha" in step_str.lower():
+                                logger.info(f"Found potential commit info in progress: {step}")
+        
+        if not github_repo:
+            logger.warning(f"Could not find GitHub repo for app {app_name} (id: {app_id})")
         
         return {
             "github_repo": github_repo,
             "commit_sha": commit_sha or "unknown",
-            "app_name": spec.get("name", "")
+            "app_name": app_name
         }
 
 
