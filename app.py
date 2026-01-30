@@ -625,6 +625,13 @@ async def digitalocean_webhook(request: Request):
     """
     Receive webhooks directly from DigitalOcean alerts.
     Configure DO alerts to POST to this endpoint on deployment failures.
+    
+    Fully automated flow:
+    1. DO sends alert webhook
+    2. Fetch deployment logs from DO API
+    3. Get GitHub repo info from DO app spec
+    4. Analyze logs with LLM
+    5. Post analysis as GitHub commit comment
     """
     try:
         data = await request.json()
@@ -634,33 +641,273 @@ async def digitalocean_webhook(request: Request):
     logger.info(f"Received DO webhook: {data}")
     
     # Extract info from DO alert payload
-    alert_type = data.get("alert_type", "")
-    app_name = data.get("app_name", "")
-    app_id = data.get("app_id", "")
+    # DO alert format varies, try multiple fields
+    app_id = data.get("app_id") or data.get("entity", {}).get("id", "")
+    app_name = data.get("app_name") or data.get("entity", {}).get("name", "")
+    alert_type = data.get("alert_type") or data.get("type", "")
     
     # Check if this is a deployment failure
-    if "DEPLOYMENT_FAILED" in str(data) or "failed" in str(data).lower():
-        logger.info(f"Deployment failure detected for app: {app_name}")
+    is_failure = (
+        "DEPLOYMENT_FAILED" in str(data).upper() or 
+        "DEPLOY_FAILED" in str(data).upper() or
+        "failed" in str(data).lower() or
+        "error" in str(alert_type).lower()
+    )
+    
+    if not is_failure:
+        logger.info(f"Not a deployment failure, ignoring: {alert_type}")
+        return {"status": "ignored", "reason": "not a deployment failure"}
+    
+    logger.info(f"🚨 Deployment failure detected for app: {app_name} (ID: {app_id})")
+    
+    if not DIGITALOCEAN_TOKEN:
+        logger.error("DIGITALOCEAN_TOKEN not configured")
+        return {"status": "error", "message": "DO token not configured"}
+    
+    # Fetch app details and logs
+    app_info = await get_do_app_info(app_id)
+    if not app_info:
+        return {"status": "error", "message": "Failed to fetch app info"}
+    
+    logs = await fetch_latest_deployment_logs(app_id)
+    if not logs:
+        logs = "No detailed logs available"
+    
+    # Get GitHub repo from DO app spec
+    github_repo = app_info.get("github_repo")
+    commit_sha = app_info.get("commit_sha", "unknown")
+    
+    logger.info(f"GitHub repo: {github_repo}, Commit: {commit_sha}")
+    
+    # Analyze with LLM
+    analysis = await analyze_deployment_failure(
+        logs=logs,
+        repo_name=github_repo or app_name,
+        commit_sha=commit_sha,
+        deployment_env="digitalocean"
+    )
+    
+    # Post to GitHub if we have repo info
+    github_comment_posted = False
+    if github_repo and commit_sha != "unknown":
+        github_comment_posted = await post_analysis_to_github(
+            repo=github_repo,
+            commit_sha=commit_sha,
+            analysis=analysis,
+            app_name=app_name,
+            logs_snippet=logs[-500:] if logs else ""
+        )
+    
+    return {
+        "status": "analyzed",
+        "app": app_name,
+        "github_repo": github_repo,
+        "commit": commit_sha[:8] if commit_sha else "unknown",
+        "github_comment_posted": github_comment_posted,
+        "analysis": analysis
+    }
+
+
+async def get_do_app_info(app_id: str) -> Optional[dict]:
+    """Get app info including GitHub repo and latest commit."""
+    if not DIGITALOCEAN_TOKEN or not app_id:
+        return None
+    
+    async with httpx.AsyncClient() as client:
+        # Get app details
+        response = await client.get(
+            f"{DO_API_BASE}/apps/{app_id}",
+            headers={"Authorization": f"Bearer {DIGITALOCEAN_TOKEN}"}
+        )
         
-        # Try to fetch logs if we have the app_id
-        if app_id and DIGITALOCEAN_TOKEN:
-            logs = await fetch_latest_deployment_logs(app_id)
+        if response.status_code != 200:
+            logger.error(f"Failed to fetch app info: {response.text}")
+            return None
+        
+        app_data = response.json().get("app", {})
+        spec = app_data.get("spec", {})
+        
+        # Extract GitHub repo from spec
+        github_repo = None
+        for service in spec.get("services", []):
+            github = service.get("github", {})
+            if github:
+                repo = github.get("repo", "")
+                github_repo = repo
+                break
+        
+        # Also check for git source
+        if not github_repo:
+            for service in spec.get("services", []):
+                git = service.get("git", {})
+                if git:
+                    repo_url = git.get("repo_clone_url", "")
+                    # Extract owner/repo from URL
+                    if "github.com" in repo_url:
+                        parts = repo_url.rstrip(".git").split("github.com/")
+                        if len(parts) > 1:
+                            github_repo = parts[1]
+                    break
+        
+        # Get latest deployment commit
+        commit_sha = None
+        deployments_response = await client.get(
+            f"{DO_API_BASE}/apps/{app_id}/deployments",
+            headers={"Authorization": f"Bearer {DIGITALOCEAN_TOKEN}"},
+            params={"per_page": 1}
+        )
+        
+        if deployments_response.status_code == 200:
+            deployments = deployments_response.json().get("deployments", [])
+            if deployments:
+                # Get commit from deployment cause
+                cause = deployments[0].get("cause", {})
+                if isinstance(cause, dict):
+                    commit_sha = cause.get("commit_sha") or cause.get("git_sha", "")
+                
+                # Also try from spec
+                if not commit_sha:
+                    dep_spec = deployments[0].get("spec", {})
+                    for service in dep_spec.get("services", []):
+                        github = service.get("github", {})
+                        if github:
+                            commit_sha = github.get("commit_sha", "")
+                            break
+        
+        return {
+            "github_repo": github_repo,
+            "commit_sha": commit_sha or "unknown",
+            "app_name": spec.get("name", "")
+        }
+
+
+async def post_analysis_to_github(
+    repo: str,
+    commit_sha: str,
+    analysis: str,
+    app_name: str,
+    logs_snippet: str = ""
+) -> bool:
+    """Post the analysis as a comment on the GitHub commit."""
+    
+    # Parse repo
+    parts = repo.split("/")
+    if len(parts) != 2:
+        logger.error(f"Invalid repo format: {repo}")
+        return False
+    
+    owner, repo_name = parts
+    
+    # Find the installation for this repo
+    installation_id = await find_installation_for_repo(owner, repo_name)
+    
+    if not installation_id:
+        logger.warning(f"No GitHub App installation found for {repo}")
+        return False
+    
+    try:
+        installation_token = await get_installation_token(installation_id)
+    except Exception as e:
+        logger.error(f"Failed to get installation token: {e}")
+        return False
+    
+    # Create comment body
+    comment_body = f"""## 🚨 DigitalOcean Deployment Failed - AI Analysis
+
+**App:** `{app_name}`
+**Commit:** `{commit_sha[:8]}`
+**Time:** {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}
+
+---
+
+{analysis}
+
+---
+
+<details>
+<summary>📋 Log Snippet</summary>
+
+```
+{logs_snippet}
+```
+
+</details>
+
+---
+*Powered by [DO Deploy Analyzer](https://github.com/apps/do-deploy-analyzer) - Automatic deployment failure analysis*
+"""
+    
+    # Post comment
+    success = await post_commit_comment(
+        installation_token=installation_token,
+        owner=owner,
+        repo=repo_name,
+        commit_sha=commit_sha,
+        body=comment_body
+    )
+    
+    if success:
+        logger.info(f"✅ Posted analysis to GitHub: {repo}@{commit_sha[:8]}")
+    
+    return success
+
+
+async def find_installation_for_repo(owner: str, repo: str) -> Optional[int]:
+    """Find the GitHub App installation ID for a repository."""
+    
+    if not GITHUB_APP_ID or not GITHUB_APP_PRIVATE_KEY:
+        return None
+    
+    jwt_token = generate_jwt_token()
+    
+    async with httpx.AsyncClient() as client:
+        # List all installations
+        response = await client.get(
+            "https://api.github.com/app/installations",
+            headers={
+                "Authorization": f"Bearer {jwt_token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28"
+            }
+        )
+        
+        if response.status_code != 200:
+            logger.error(f"Failed to list installations: {response.text}")
+            return None
+        
+        installations = response.json()
+        
+        # Find installation that has access to this repo
+        for installation in installations:
+            installation_id = installation.get("id")
+            account = installation.get("account", {})
             
-            if logs:
-                analysis = await analyze_deployment_failure(
-                    logs=logs,
-                    repo_name=app_name or "unknown",
-                    commit_sha="unknown",
-                    deployment_env="digitalocean"
+            # Check if the installation owner matches
+            if account.get("login", "").lower() == owner.lower():
+                return installation_id
+        
+        # If not found by owner, check each installation's repos
+        for installation in installations:
+            installation_id = installation.get("id")
+            
+            try:
+                token = await get_installation_token(installation_id)
+                
+                # Check if this installation has access to the repo
+                repo_response = await client.get(
+                    f"https://api.github.com/repos/{owner}/{repo}",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Accept": "application/vnd.github+json"
+                    }
                 )
                 
-                return {
-                    "status": "analyzed",
-                    "app": app_name,
-                    "analysis": analysis
-                }
-    
-    return {"status": "received", "data": data}
+                if repo_response.status_code == 200:
+                    return installation_id
+            except:
+                continue
+        
+        return None
 
 
 async def fetch_latest_deployment_logs(app_id: str) -> Optional[str]:
