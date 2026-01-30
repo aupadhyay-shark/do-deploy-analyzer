@@ -933,23 +933,73 @@ async def digitalocean_webhook(request: Request):
     
     # Post to GitHub if we have repo info
     github_comment_posted = False
-    if github_repo and commit_sha != "unknown":
-        github_comment_posted = await post_analysis_to_github(
-            repo=github_repo,
-            commit_sha=commit_sha,
-            analysis=analysis,
-            app_name=app_name,
-            logs_snippet=logs[-500:] if logs else ""
-        )
+    if github_repo:
+        # If commit_sha is unknown, try to get latest commit from GitHub
+        if commit_sha == "unknown":
+            commit_sha = await get_latest_commit_from_github(github_repo)
+            if commit_sha:
+                logger.info(f"Fetched latest commit from GitHub: {commit_sha[:8]}")
+        
+        if commit_sha and commit_sha != "unknown":
+            github_comment_posted = await post_analysis_to_github(
+                repo=github_repo,
+                commit_sha=commit_sha,
+                analysis=analysis,
+                app_name=app_name,
+                logs_snippet=logs[-500:] if logs else ""
+            )
+        else:
+            logger.warning(f"Could not determine commit SHA for {github_repo}")
+    else:
+        logger.warning(f"⚠️ No GitHub repo found for {app_name}, analysis not posted")
     
     return {
         "status": "analyzed",
         "app": app_name,
         "github_repo": github_repo,
-        "commit": commit_sha[:8] if commit_sha else "unknown",
+        "commit": commit_sha[:8] if commit_sha and commit_sha != "unknown" else "unknown",
         "github_comment_posted": github_comment_posted,
         "analysis": analysis
     }
+
+
+async def get_latest_commit_from_github(repo: str) -> Optional[str]:
+    """Get the latest commit SHA from a GitHub repo using the GitHub App."""
+    parts = repo.split("/")
+    if len(parts) != 2:
+        return None
+    
+    owner, repo_name = parts
+    
+    # Find installation and get token
+    installation_id = await find_installation_for_repo(owner, repo_name)
+    if not installation_id:
+        logger.warning(f"No GitHub App installation found for {repo}")
+        return None
+    
+    try:
+        token = await get_installation_token(installation_id)
+    except Exception as e:
+        logger.error(f"Failed to get installation token: {e}")
+        return None
+    
+    async with httpx.AsyncClient() as client:
+        # Get the default branch's latest commit
+        response = await client.get(
+            f"https://api.github.com/repos/{owner}/{repo_name}/commits",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json"
+            },
+            params={"per_page": 1}
+        )
+        
+        if response.status_code == 200:
+            commits = response.json()
+            if commits:
+                return commits[0].get("sha")
+    
+    return None
 
 
 async def get_do_app_info(app_id: str) -> Optional[dict]:
