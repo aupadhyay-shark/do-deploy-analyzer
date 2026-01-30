@@ -1,0 +1,18 @@
+# DO Deploy Analyzer - GitHub App Dependencies
+
+# Web framework
+fastapi>=0.104.0
+uvicorn>=0.24.0
+
+# HTTP client for API calls
+httpx>=0.25.0
+
+# JWT for GitHub App authentication
+PyJWT>=2.8.0
+cryptography>=41.0.0
+
+# Data validation
+pydantic>=2.5.0
+
+# Environment variables
+python-dotenv>=1.0.0

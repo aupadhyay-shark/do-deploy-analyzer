@@ -1,0 +1,67 @@
+# DO Deploy Analyzer - DigitalOcean App Platform Deployment
+# A GitHub Marketplace App for AI-powered deployment failure analysis
+
+name: do-deploy-analyzer
+region: nyc
+
+alerts:
+  - rule: DEPLOYMENT_FAILED
+  - rule: DOMAIN_FAILED
+
+ingress:
+  rules:
+    - component:
+        name: web
+      match:
+        path:
+          prefix: /
+
+services:
+  - name: web
+    
+    # GitHub repository - UPDATE THIS after creating repo
+    github:
+      branch: main
+      repo: aupadhyay-shark/do-deploy-analyzer
+      deploy_on_push: true
+    
+    # Dockerfile at repo root
+    dockerfile_path: /Dockerfile
+    
+    # HTTP configuration
+    http_port: 8000
+    
+    # Instance configuration
+    instance_size_slug: apps-s-1vcpu-1gb
+    instance_count: 1
+    
+    # Health check
+    health_check:
+      http_path: /health
+      initial_delay_seconds: 10
+      period_seconds: 30
+      timeout_seconds: 5
+      success_threshold: 1
+      failure_threshold: 3
+    
+    # Environment variables
+    # Set SECRET values via DO Dashboard for security
+    envs:
+      - key: GITHUB_APP_ID
+        scope: RUN_TIME
+        value: "${GITHUB_APP_ID}"
+      
+      - key: GITHUB_APP_PRIVATE_KEY
+        scope: RUN_TIME
+        type: SECRET
+        value: "${GITHUB_APP_PRIVATE_KEY}"
+      
+      - key: GITHUB_WEBHOOK_SECRET
+        scope: RUN_TIME
+        type: SECRET
+        value: "${GITHUB_WEBHOOK_SECRET}"
+      
+      - key: OPENAI_API_KEY
+        scope: RUN_TIME
+        type: SECRET
+        value: "${OPENAI_API_KEY}"
