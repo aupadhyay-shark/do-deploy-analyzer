@@ -560,6 +560,206 @@ async def connect_digitalocean(installation_id: int, do_token: str):
 
 
 # =============================================================================
+# DigitalOcean Direct Integration
+# =============================================================================
+
+# DigitalOcean token for fetching logs (set via env var)
+DIGITALOCEAN_TOKEN = os.getenv("DIGITALOCEAN_TOKEN")
+
+# Store repo -> DO app mappings
+repo_app_mappings = {}
+
+
+class AnalyzeRequest(BaseModel):
+    repo: str  # e.g., "owner/repo"
+    commit_sha: Optional[str] = None
+    logs: Optional[str] = None
+    do_app_id: Optional[str] = None
+
+
+@app.post("/analyze")
+async def analyze_deployment(request: AnalyzeRequest):
+    """
+    Direct endpoint to analyze deployment failures.
+    Can be called:
+    1. Manually with logs
+    2. From DigitalOcean alerts
+    3. With DO app_id to fetch logs automatically
+    """
+    logger.info(f"Analyze request for repo: {request.repo}")
+    
+    logs = request.logs
+    
+    # If no logs provided but DO app_id given, fetch from DO API
+    if not logs and request.do_app_id and DIGITALOCEAN_TOKEN:
+        logs = await fetch_latest_deployment_logs(request.do_app_id)
+    
+    if not logs:
+        return {"status": "error", "message": "No logs provided and unable to fetch from DO"}
+    
+    # Parse repo
+    parts = request.repo.split("/")
+    if len(parts) != 2:
+        return {"status": "error", "message": "Invalid repo format. Use 'owner/repo'"}
+    
+    owner, repo = parts
+    commit_sha = request.commit_sha or "unknown"
+    
+    # Analyze with LLM
+    analysis = await analyze_deployment_failure(
+        logs=logs,
+        repo_name=request.repo,
+        commit_sha=commit_sha,
+        deployment_env="digitalocean"
+    )
+    
+    return {
+        "status": "analyzed",
+        "repo": request.repo,
+        "analysis": analysis
+    }
+
+
+@app.post("/webhook/digitalocean")
+async def digitalocean_webhook(request: Request):
+    """
+    Receive webhooks directly from DigitalOcean alerts.
+    Configure DO alerts to POST to this endpoint on deployment failures.
+    """
+    try:
+        data = await request.json()
+    except:
+        data = {}
+    
+    logger.info(f"Received DO webhook: {data}")
+    
+    # Extract info from DO alert payload
+    alert_type = data.get("alert_type", "")
+    app_name = data.get("app_name", "")
+    app_id = data.get("app_id", "")
+    
+    # Check if this is a deployment failure
+    if "DEPLOYMENT_FAILED" in str(data) or "failed" in str(data).lower():
+        logger.info(f"Deployment failure detected for app: {app_name}")
+        
+        # Try to fetch logs if we have the app_id
+        if app_id and DIGITALOCEAN_TOKEN:
+            logs = await fetch_latest_deployment_logs(app_id)
+            
+            if logs:
+                analysis = await analyze_deployment_failure(
+                    logs=logs,
+                    repo_name=app_name or "unknown",
+                    commit_sha="unknown",
+                    deployment_env="digitalocean"
+                )
+                
+                return {
+                    "status": "analyzed",
+                    "app": app_name,
+                    "analysis": analysis
+                }
+    
+    return {"status": "received", "data": data}
+
+
+async def fetch_latest_deployment_logs(app_id: str) -> Optional[str]:
+    """Fetch logs from the latest failed deployment."""
+    if not DIGITALOCEAN_TOKEN:
+        return None
+    
+    async with httpx.AsyncClient() as client:
+        # Get latest deployments
+        response = await client.get(
+            f"{DO_API_BASE}/apps/{app_id}/deployments",
+            headers={"Authorization": f"Bearer {DIGITALOCEAN_TOKEN}"},
+            params={"per_page": 5}
+        )
+        
+        if response.status_code != 200:
+            logger.error(f"Failed to fetch deployments: {response.text}")
+            return None
+        
+        deployments = response.json().get("deployments", [])
+        
+        # Find latest failed deployment
+        failed_deployment = None
+        for dep in deployments:
+            if dep.get("phase") in ["ERROR", "FAILED"]:
+                failed_deployment = dep
+                break
+        
+        if not failed_deployment:
+            # Use the latest deployment
+            failed_deployment = deployments[0] if deployments else None
+        
+        if not failed_deployment:
+            return None
+        
+        deployment_id = failed_deployment.get("id")
+        
+        # Get app spec to find component name
+        app_response = await client.get(
+            f"{DO_API_BASE}/apps/{app_id}",
+            headers={"Authorization": f"Bearer {DIGITALOCEAN_TOKEN}"}
+        )
+        
+        if app_response.status_code != 200:
+            return None
+        
+        app_data = app_response.json().get("app", {})
+        services = app_data.get("spec", {}).get("services", [])
+        
+        if not services:
+            return None
+        
+        component_name = services[0].get("name", "")
+        
+        # Fetch build logs
+        logs_response = await client.get(
+            f"{DO_API_BASE}/apps/{app_id}/deployments/{deployment_id}/components/{component_name}/logs",
+            headers={"Authorization": f"Bearer {DIGITALOCEAN_TOKEN}"},
+            params={"type": "BUILD", "follow": "false"}
+        )
+        
+        if logs_response.status_code != 200:
+            # Try RUN logs
+            logs_response = await client.get(
+                f"{DO_API_BASE}/apps/{app_id}/deployments/{deployment_id}/components/{component_name}/logs",
+                headers={"Authorization": f"Bearer {DIGITALOCEAN_TOKEN}"},
+                params={"type": "RUN", "follow": "false"}
+            )
+        
+        if logs_response.status_code != 200:
+            return None
+        
+        logs_data = logs_response.json()
+        
+        # Get logs from historic URL if available
+        if "historic_urls" in logs_data and logs_data["historic_urls"]:
+            log_url = logs_data["historic_urls"][0]
+            log_content = await client.get(log_url)
+            if log_content.status_code == 200:
+                return log_content.text
+        
+        return str(logs_data)
+
+
+@app.post("/register-repo")
+async def register_repo(repo: str, do_app_id: str):
+    """Register a GitHub repo to a DigitalOcean app for automatic analysis."""
+    repo_app_mappings[repo] = do_app_id
+    logger.info(f"Registered {repo} -> {do_app_id}")
+    return {"status": "registered", "repo": repo, "do_app_id": do_app_id}
+
+
+@app.get("/registered-repos")
+async def list_registered_repos():
+    """List all registered repo -> DO app mappings."""
+    return {"mappings": repo_app_mappings}
+
+
+# =============================================================================
 # Health Check
 # =============================================================================
 
@@ -569,7 +769,8 @@ async def health_check():
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
         "github_app_configured": bool(GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY),
-        "openai_configured": bool(OPENAI_API_KEY)
+        "openai_configured": bool(OPENAI_API_KEY),
+        "do_token_configured": bool(DIGITALOCEAN_TOKEN)
     }
 
 
