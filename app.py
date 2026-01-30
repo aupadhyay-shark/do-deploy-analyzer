@@ -75,7 +75,7 @@ async def check_all_apps_for_failures():
 
 
 async def check_app_deployment(app_id: str, app_name: str):
-    """Check a specific app for failed deployments."""
+    """Check a specific app for failed deployments or runtime errors."""
     async with httpx.AsyncClient() as client:
         response = await client.get(
             f"{DO_API_BASE}/apps/{app_id}/deployments",
@@ -90,13 +90,13 @@ async def check_app_deployment(app_id: str, app_name: str):
         
         for deployment in deployments:
             deployment_id = deployment.get("id")
-            phase = deployment.get("phase", "")
+            phase = deployment.get("phase", "").upper()
             
             # Skip if already processed
             if deployment_id in processed_deployments:
                 continue
             
-            # Check if this is a recent failure (within last 10 minutes)
+            # Check if this is a recent deployment (within last 10 minutes)
             created_at = deployment.get("created_at", "")
             if created_at:
                 try:
@@ -108,9 +108,28 @@ async def check_app_deployment(app_id: str, app_name: str):
                 except:
                     pass
             
-            # Check for failure
-            if phase in ["ERROR", "FAILED"]:
-                logger.info(f"🚨 Found failed deployment: {app_name} ({deployment_id[:8]})")
+            # Check for build/deploy failure
+            is_failed = phase in ["ERROR", "FAILED", "CANCELED"]
+            
+            # Also check progress steps for failures
+            progress = deployment.get("progress", {})
+            steps = progress.get("steps", [])
+            for step in steps:
+                step_status = step.get("status", "").upper()
+                if step_status in ["ERROR", "FAILED"]:
+                    is_failed = True
+                    break
+            
+            # Check for runtime errors - if deployment is ACTIVE but app keeps crashing
+            # We need to check run logs for errors
+            if phase == "ACTIVE" and deployment_id not in processed_deployments:
+                # Check if there are runtime errors
+                has_runtime_error = await check_for_runtime_errors(app_id, deployment_id, app_name)
+                if has_runtime_error:
+                    is_failed = True
+            
+            if is_failed:
+                logger.info(f"🚨 Found failed deployment: {app_name} ({deployment_id[:8]}) - phase: {phase}")
                 
                 # Mark as processed
                 processed_deployments.add(deployment_id)
@@ -120,6 +139,65 @@ async def check_app_deployment(app_id: str, app_name: str):
                 
                 # Only process the most recent failure per app
                 break
+
+
+async def check_for_runtime_errors(app_id: str, deployment_id: str, app_name: str) -> bool:
+    """Check if a deployment has runtime errors (app crashing after start)."""
+    async with httpx.AsyncClient() as client:
+        # Get app spec to find component name
+        app_response = await client.get(
+            f"{DO_API_BASE}/apps/{app_id}",
+            headers={"Authorization": f"Bearer {DIGITALOCEAN_TOKEN}"}
+        )
+        
+        if app_response.status_code != 200:
+            return False
+        
+        app_data = app_response.json().get("app", {})
+        services = app_data.get("spec", {}).get("services", [])
+        
+        if not services:
+            return False
+        
+        component_name = services[0].get("name", "")
+        
+        # Get RUN logs
+        logs_response = await client.get(
+            f"{DO_API_BASE}/apps/{app_id}/deployments/{deployment_id}/components/{component_name}/logs",
+            headers={"Authorization": f"Bearer {DIGITALOCEAN_TOKEN}"},
+            params={"type": "RUN", "follow": "false"}
+        )
+        
+        if logs_response.status_code != 200:
+            return False
+        
+        logs_data = logs_response.json()
+        
+        # Get actual log content
+        log_content = ""
+        if "historic_urls" in logs_data and logs_data["historic_urls"]:
+            log_url = logs_data["historic_urls"][0]
+            log_fetch = await client.get(log_url)
+            if log_fetch.status_code == 200:
+                log_content = log_fetch.text
+        
+        # Check for common error patterns
+        error_patterns = [
+            "Error:", "ERROR:", "error:", 
+            "Exception:", "EXCEPTION:",
+            "ReferenceError:", "TypeError:", "SyntaxError:",
+            "ModuleNotFoundError:", "ImportError:",
+            "exited with code: 1", "exit code 1",
+            "FATAL", "fatal error",
+            "Cannot find module", "Module not found"
+        ]
+        
+        for pattern in error_patterns:
+            if pattern in log_content:
+                logger.info(f"🔍 Runtime error detected in {app_name}: found '{pattern}'")
+                return True
+        
+        return False
 
 
 async def process_failed_deployment(app_id: str, app_name: str, deployment: dict):
