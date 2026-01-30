@@ -218,6 +218,15 @@ async def process_failed_deployment(app_id: str, app_name: str, deployment: dict
     github_repo = app_info.get("github_repo")
     commit_sha = app_info.get("commit_sha", "unknown")
     
+    # Check registered mappings if no GitHub repo found
+    if not github_repo:
+        # Search by app_id
+        for repo, mapped_app_id in repo_app_mappings.items():
+            if mapped_app_id == app_id:
+                github_repo = repo
+                logger.info(f"Found registered mapping: {repo} -> {app_id}")
+                break
+    
     # Analyze with LLM
     analysis = await analyze_deployment_failure(
         logs=logs,
