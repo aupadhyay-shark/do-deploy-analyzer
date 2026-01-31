@@ -180,10 +180,21 @@ async def process_failed_deployment(app_id: str, app_name: str, deployment: dict
                 github_repo = repo
                 break
     
-    analysis = await analyze_deployment_failure(logs, github_repo or app_name, commit_sha)
+    # Fetch codebase context for better analysis
+    codebase_context = ""
+    if github_repo:
+        parts = github_repo.split("/")
+        if len(parts) == 2:
+            logger.info(f"Fetching codebase from {github_repo} for analysis...")
+            if commit_sha == "unknown":
+                commit_sha = await get_latest_commit_from_github(github_repo) or "HEAD"
+            codebase_context = await fetch_codebase_context(parts[0], parts[1], commit_sha)
+            logger.info(f"Fetched {len(codebase_context)} chars of codebase context")
+    
+    analysis = await analyze_deployment_failure(logs, github_repo or app_name, commit_sha, codebase_context)
     
     if github_repo:
-        if commit_sha == "unknown":
+        if commit_sha == "unknown" or commit_sha == "HEAD":
             commit_sha = await get_latest_commit_from_github(github_repo) or "unknown"
         
         if commit_sha != "unknown":
@@ -298,34 +309,195 @@ async def get_latest_commit_from_github(repo: str) -> Optional[str]:
 
 
 # =============================================================================
+# Fetch Repository Codebase
+# =============================================================================
+
+# Key files to fetch for build failure analysis
+BUILD_RELATED_FILES = [
+    "Dockerfile",
+    "docker-compose.yml",
+    "docker-compose.yaml",
+    "requirements.txt",
+    "package.json",
+    "package-lock.json",
+    "yarn.lock",
+    "Gemfile",
+    "go.mod",
+    "pom.xml",
+    "build.gradle",
+    ".do/app.yaml",
+    "app.yaml",
+    "Procfile",
+    ".env.example",
+    "tsconfig.json",
+    "pyproject.toml",
+    "setup.py",
+]
+
+
+async def fetch_file_content(
+    client: httpx.AsyncClient,
+    owner: str,
+    repo: str,
+    path: str,
+    token: str
+) -> Optional[str]:
+    """Fetch a single file's content from GitHub."""
+    try:
+        response = await client.get(
+            f"https://api.github.com/repos/{owner}/{repo}/contents/{path}",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28"
+            }
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("encoding") == "base64":
+                import base64
+                content = base64.b64decode(data["content"]).decode("utf-8", errors="replace")
+                return content
+        return None
+    except Exception as e:
+        logger.error(f"Error fetching {path}: {e}")
+        return None
+
+
+async def fetch_repo_tree(
+    client: httpx.AsyncClient,
+    owner: str,
+    repo: str,
+    token: str,
+    sha: str = "HEAD"
+) -> list:
+    """Fetch the repository file tree to find relevant files."""
+    try:
+        response = await client.get(
+            f"https://api.github.com/repos/{owner}/{repo}/git/trees/{sha}",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28"
+            },
+            params={"recursive": "1"}
+        )
+        
+        if response.status_code == 200:
+            return response.json().get("tree", [])
+        return []
+    except Exception as e:
+        logger.error(f"Error fetching repo tree: {e}")
+        return []
+
+
+async def fetch_codebase_context(
+    owner: str,
+    repo: str,
+    commit_sha: str
+) -> str:
+    """
+    Fetch relevant codebase files for build failure analysis.
+    Returns formatted string with file contents.
+    """
+    parts = f"{owner}/{repo}".split("/")
+    if len(parts) != 2:
+        return "Could not parse repository."
+    
+    installation_id = await find_installation_for_repo(owner, repo)
+    if not installation_id:
+        return "GitHub App not installed on repository."
+    
+    try:
+        token = await get_installation_token(installation_id)
+    except:
+        return "Could not authenticate with GitHub."
+    
+    codebase_context = []
+    
+    async with httpx.AsyncClient() as client:
+        # First, get the repo tree to find all files
+        tree = await fetch_repo_tree(client, owner, repo, token, commit_sha)
+        
+        # Find files that match our build-related patterns
+        files_to_fetch = []
+        for item in tree:
+            if item.get("type") != "blob":
+                continue
+            path = item.get("path", "")
+            filename = path.split("/")[-1]
+            
+            # Check if it's a build-related file
+            if filename in BUILD_RELATED_FILES or path in BUILD_RELATED_FILES:
+                files_to_fetch.append(path)
+            # Also fetch main app files (Python, JS, etc.)
+            elif filename.endswith((".py", ".js", ".ts", ".go", ".rb", ".java")) and "/" not in path:
+                files_to_fetch.append(path)
+            # Fetch config files in root or .do directory
+            elif path.startswith(".do/") or path.startswith("deploy/"):
+                files_to_fetch.append(path)
+        
+        # Limit to most important files (to avoid token limits)
+        files_to_fetch = files_to_fetch[:15]
+        
+        # Fetch each file
+        for file_path in files_to_fetch:
+            content = await fetch_file_content(client, owner, repo, file_path, token)
+            if content:
+                # Truncate large files
+                if len(content) > 3000:
+                    content = content[:3000] + "\n... [truncated]"
+                codebase_context.append(f"=== FILE: {file_path} ===\n{content}")
+    
+    if codebase_context:
+        return "\n\n".join(codebase_context)
+    return "No codebase files could be fetched."
+
+
+# =============================================================================
 # LLM Analysis
 # =============================================================================
 
-async def analyze_deployment_failure(logs: str, repo_name: str, commit_sha: str) -> str:
+async def analyze_deployment_failure(logs: str, repo_name: str, commit_sha: str, codebase_context: str = "") -> str:
     if not OPENAI_API_KEY:
         return "LLM analysis unavailable - OpenAI API key not configured"
+    
+    # Build the prompt with codebase context
+    codebase_section = ""
+    if codebase_context and codebase_context not in ["No codebase files could be fetched.", "Could not parse repository.", "GitHub App not installed on repository.", "Could not authenticate with GitHub."]:
+        codebase_section = f"""
+CODEBASE FILES (from repository):
+```
+{codebase_context[:8000]}
+```
+
+"""
     
     prompt = f"""Analyze this DigitalOcean deployment failure:
 
 Repository: {repo_name}
 Commit: {commit_sha[:8] if commit_sha != "unknown" else "unknown"}
 
-Logs:
+{codebase_section}DEPLOYMENT/BUILD LOGS:
 ```
 {logs[-6000:]}
 ```
 
 Provide:
-## Root Cause
-[What went wrong]
+## 🔍 Root Cause
+[What exactly went wrong - reference specific files and line numbers if possible]
 
-## Suggested Fix
-[How to fix it]
+## 🛠️ Suggested Fix
+[Step-by-step fix with exact code changes needed. Show the specific file and what to change]
 
-## Prevention Tips
-[How to prevent this]
+## 📚 Related Documentation
+[Links to relevant docs if applicable]
 
-Keep it concise and actionable."""
+## 💡 Prevention Tips
+[How to prevent this in the future]
+
+Be specific! Reference exact file names, line numbers, and provide copy-paste ready fixes when possible."""
 
     async with httpx.AsyncClient() as client:
         response = await client.post(
@@ -334,13 +506,13 @@ Keep it concise and actionable."""
             json={
                 "model": "gpt-4o-mini",
                 "messages": [
-                    {"role": "system", "content": "You are a DevOps expert."},
+                    {"role": "system", "content": "You are a DevOps expert. You analyze build failures by examining both the error logs AND the actual codebase to provide specific, actionable fixes."},
                     {"role": "user", "content": prompt}
                 ],
-                "max_tokens": 1500,
+                "max_tokens": 2000,
                 "temperature": 0.3
             },
-            timeout=60.0
+            timeout=90.0
         )
         if response.status_code != 200:
             return "Failed to analyze deployment"
@@ -576,3 +748,4 @@ async def register_repo(repo: str, do_app_id: str):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
